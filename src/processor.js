@@ -156,11 +156,13 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
 
   } catch (err) {
     console.error(`[${jobId}] Error:`, err)
-    await supabase.from('video_jobs').update({
-      status: 'error',
-      error_message: err instanceof Error ? err.message : String(err),
-      finished_at: new Date().toISOString(),
-    }).eq('id', jobId).catch(() => {})
+    try {
+      await supabase.from('video_jobs').update({
+        status: 'error',
+        error_message: err instanceof Error ? err.message : String(err),
+        finished_at: new Date().toISOString(),
+      }).eq('id', jobId)
+    } catch { /* ignore secondary error */ }
   } finally {
     // Чистим временные файлы
     fs.rmSync(tmpDir, { recursive: true, force: true })
@@ -169,19 +171,44 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
 }
 
 // ── Транскрипция через Whisper ──────────────────────────────────────────────
+// Whisper API принимает максимум 25 МБ — сначала извлекаем аудио через FFmpeg
 async function transcribeWithWhisper(videoPath, language) {
   const openai = getOpenAI()
 
-  // Передаём видеофайл напрямую (Whisper принимает mp4/mov/avi)
-  const response = await openai.audio.transcriptions.create({
-    file: fs.createReadStream(videoPath),
-    model: 'whisper-1',
-    response_format: 'verbose_json',
-    timestamp_granularities: ['word'],
-    language: language === 'auto' ? undefined : language,
-  })
+  // Извлекаем аудио в mp3 (mono, 64k) — обычно < 10 МБ для видео до часа
+  const audioPath = videoPath.replace(/\.[^/.]+$/, '') + '_audio.mp3'
+  await extractAudio(videoPath, audioPath)
 
-  return response
+  try {
+    const response = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: 'whisper-1',
+      response_format: 'verbose_json',
+      timestamp_granularities: ['word'],
+      language: language === 'auto' ? undefined : language,
+    })
+    return response
+  } finally {
+    // Удаляем временный аудиофайл
+    try { fs.unlinkSync(audioPath) } catch { /* ignore */ }
+  }
+}
+
+// Извлечение аудио в mp3 mono 64k
+function extractAudio(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-vn',          // без видео
+        '-ac', '1',     // mono
+        '-ar', '16000', // 16kHz — оптимально для Whisper
+        '-b:a', '64k',  // 64 kbps
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run()
+  })
 }
 
 // ── Детект слов-паразитов и пауз ────────────────────────────────────────────

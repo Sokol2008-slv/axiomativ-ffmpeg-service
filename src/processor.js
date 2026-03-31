@@ -201,8 +201,8 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
 async function transcribeWithWhisper(videoPath, language) {
   const openai = getOpenAI()
 
-  // .m4a (AAC) — всегда есть в FFmpeg, в отличие от libmp3lame
-  const audioPath = path.join(path.dirname(videoPath), 'whisper_audio.m4a')
+  // WAV (PCM) — никаких кодеков, всегда работает. 37с моно 16кГц = ~1.2МБ
+  const audioPath = path.join(path.dirname(videoPath), 'whisper_audio.wav')
   await extractAudio(videoPath, audioPath)
 
   try {
@@ -250,17 +250,17 @@ function normalizeVideo(inputPath, outputPath) {
   })
 }
 
-// Извлечение аудио в m4a (AAC) mono 16kHz — для Whisper
-// AAC всегда доступен в FFmpeg (в отличие от libmp3lame)
+// Извлечение аудио в WAV PCM — без кодеков, гарантированно работает
+// mono 16kHz 16-bit = ~1.2МБ/минуту, Whisper принимает WAV
 function extractAudio(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .outputOptions([
-        '-vn',           // без видео
-        '-ac', '1',      // mono
-        '-ar', '16000',  // 16kHz — оптимально для Whisper
-        '-c:a', 'aac',   // AAC кодек
-        '-b:a', '64k',
+        '-vn',                // без видео
+        '-ac', '1',           // mono
+        '-ar', '16000',       // 16kHz
+        '-acodec', 'pcm_s16le', // RAW PCM — нет кодека, нет проблем
+        '-f', 'wav',          // WAV контейнер
       ])
       .output(outputPath)
       .on('end', resolve)

@@ -66,7 +66,11 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
       console.log(`[${jobId}] Downloaded: ${inputPath}`)
     }
 
-    let currentPath = inputPath
+    // 3.5. Конвертируем в 1080p MP4 — снижаем нагрузку на FFmpeg при обработке
+    const normalizedPath = path.join(tmpDir, 'normalized.mp4')
+    console.log(`[${jobId}] Normalizing to 1080p MP4...`)
+    await normalizeVideo(inputPath, normalizedPath)
+    let currentPath = normalizedPath
 
     // 4. Транскрипция через Whisper (если нужны субтитры или удаление пауз)
     let wordTimestamps = []
@@ -192,6 +196,28 @@ async function transcribeWithWhisper(videoPath, language) {
     // Удаляем временный аудиофайл
     try { fs.unlinkSync(audioPath) } catch { /* ignore */ }
   }
+}
+
+// Нормализация видео: scale до 1080p, конвертация в H.264 MP4
+// Снижает нагрузку на FFmpeg при дальнейшей обработке
+function normalizeVideo(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-vf', 'scale=\'min(1920,iw)\':\'min(1080,ih)\':force_original_aspect_ratio=decrease',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast', // быстрее = меньше RAM
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-movflags', '+faststart',
+        '-threads', '2',
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run()
+  })
 }
 
 // Извлечение аудио в mp3 mono 64k

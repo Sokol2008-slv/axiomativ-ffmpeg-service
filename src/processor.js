@@ -7,9 +7,19 @@ import path from 'path'
 import os from 'os'
 import { randomUUID } from 'crypto'
 import { Readable } from 'stream'
+import { execSync } from 'child_process'
 
-// Используем статичный ffmpeg бинарник
-ffmpeg.setFfmpegPath(ffmpegStatic)
+// Используем системный ffmpeg (nixpkgs) — он собран с libass/subtitles.
+// Если недоступен — fallback на статичный бинарник.
+let ffmpegPath = ffmpegStatic
+try {
+  const sys = execSync('which ffmpeg 2>/dev/null').toString().trim()
+  if (sys) {
+    ffmpegPath = sys
+    console.log(`Using system ffmpeg: ${sys}`)
+  }
+} catch { /* ignore */ }
+ffmpeg.setFfmpegPath(ffmpegPath)
 
 function getSupabase() {
   return createClient(

@@ -23,10 +23,14 @@ function getOpenAI() {
 }
 
 // ── Главная функция обработки ──────────────────────────────────────────────
-export async function processVideoJob(jobId, userId) {
+// uploadedFilePath — если файл уже на диске (прямая загрузка), null — скачиваем из Storage
+export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
   const supabase = getSupabase()
-  const tmpDir = path.join(os.tmpdir(), `job_${jobId}_${randomUUID()}`)
-  fs.mkdirSync(tmpDir, { recursive: true })
+  const tmpDir = uploadedFilePath
+    ? path.dirname(uploadedFilePath)
+    : path.join(os.tmpdir(), `job_${jobId}_${randomUUID()}`)
+
+  if (!uploadedFilePath) fs.mkdirSync(tmpDir, { recursive: true })
 
   console.log(`[${jobId}] Starting processing in ${tmpDir}`)
 
@@ -47,16 +51,20 @@ export async function processVideoJob(jobId, userId) {
       started_at: new Date().toISOString()
     }).eq('id', jobId)
 
-    // 3. Скачиваем исходное видео из Supabase Storage
-    const { data: signedData } = await supabase.storage
-      .from('videos')
-      .createSignedUrl(job.storage_path, 3600)
-
-    if (!signedData?.signedUrl) throw new Error('Failed to get signed URL')
-
-    const inputPath = path.join(tmpDir, `input_${Date.now()}.mp4`)
-    await downloadFile(signedData.signedUrl, inputPath)
-    console.log(`[${jobId}] Downloaded: ${inputPath}`)
+    // 3. Берём файл с диска или скачиваем из Storage
+    let inputPath
+    if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+      inputPath = uploadedFilePath
+      console.log(`[${jobId}] Using uploaded file: ${inputPath}`)
+    } else {
+      const { data: signedData } = await supabase.storage
+        .from('videos')
+        .createSignedUrl(job.storage_path, 3600)
+      if (!signedData?.signedUrl) throw new Error('Failed to get signed URL')
+      inputPath = path.join(tmpDir, `input_${Date.now()}.mp4`)
+      await downloadFile(signedData.signedUrl, inputPath)
+      console.log(`[${jobId}] Downloaded: ${inputPath}`)
+    }
 
     let currentPath = inputPath
 

@@ -250,24 +250,44 @@ function extractAudio(inputPath, outputPath) {
 // ── Детект слов-паразитов и пауз ────────────────────────────────────────────
 function detectFillerSegments(words) {
   const FILLER_WORDS = new Set([
+    // Короткие звуки — самое важное
+    'э', 'е', 'а', 'и',
     // Русские
-    'эм', 'эмм', 'эммм', 'ммм', 'мм', 'ааа', 'аааа', 'ну',
-    'вот', 'типа', 'короче', 'блин', 'собственно', 'значит',
+    'эм', 'эмм', 'эммм', 'эм-м', 'ммм', 'мм', 'м',
+    'ааа', 'аа', 'ааааа', 'ехх', 'эх',
+    'ну', 'вот', 'типа', 'короче', 'блин', 'собственно',
+    'значит', 'как бы', 'вообще', 'просто', 'буквально',
+    // Украинские
+    'е', 'ну', 'от', 'отже', 'значить', 'тобто', 'власне',
+    'взагалі', 'просто', 'якось', 'ось',
     // Английские
-    'um', 'uh', 'uhh', 'uhm', 'hmm', 'hm', 'erm',
+    'um', 'uh', 'uhh', 'uhm', 'hmm', 'hm', 'erm', 'err', 'like', 'you know',
   ])
-  const MIN_PAUSE = 0.65   // паузы длиннее этого вырезаем
-  const KEEP_PAUSE = 0.20  // оставляем такую паузу вместо длинной
+
+  // Паттерны для regex-детекта: повторяющиеся гласные/согласные = звук-паразит
+  const FILLER_PATTERN = /^[эеаиуоыёэ]{1,2}$/i  // одна-две гласных = "э", "е", "а"
+
+  const MIN_PAUSE = 0.45   // паузы длиннее 0.45с вырезаем (было 0.65)
+  const KEEP_PAUSE = 0.15  // оставляем небольшую паузу для естественности
+
+  // Максимальная длительность слова-паразита — защита от случайных совпадений
+  const MAX_FILLER_DURATION = 1.5
 
   const segments = []
 
   for (let i = 0; i < words.length; i++) {
     const w = words[i]
-    const clean = w.word.toLowerCase().replace(/[.,!?…]/g, '').trim()
+    const clean = w.word.toLowerCase().replace(/[.,!?…\-–]/g, '').trim()
+    const duration = w.end - w.start
 
-    // Слово-паразит
-    if (FILLER_WORDS.has(clean)) {
-      segments.push({ start: w.start, end: w.end })
+    // Слово-паразит: по списку или по паттерну коротких звуков
+    const isFiller = FILLER_WORDS.has(clean) || FILLER_PATTERN.test(clean)
+    if (isFiller && duration <= MAX_FILLER_DURATION) {
+      // Добавляем небольшой отступ чтобы не обрезать соседние слова
+      segments.push({
+        start: Math.max(0, w.start - 0.02),
+        end: w.end + 0.05,
+      })
     }
 
     // Пауза между словами

@@ -262,22 +262,24 @@ function extractAudio(inputPath, outputPath) {
 // ── Детект слов-паразитов и пауз ────────────────────────────────────────────
 function detectFillerSegments(words) {
   const FILLER_WORDS = new Set([
-    // Короткие звуки-паразиты
-    'э', 'е', 'а',
-    'эм', 'эмм', 'эммм', 'эм-м', 'ммм', 'мм', 'м',
-    'ааа', 'аа', 'ааааа', 'эх',
+    // Только однозначные звуки-паразиты (НЕ однобуквенные — "е"/"а"/"є" = реальные слова!)
+    'эм', 'эмм', 'эммм', 'эм-м',
+    'ммм', 'мм', 'хм', 'хмм',
+    'ааа', 'аааа', 'ааааа',
+    'эээ', 'ээ',
     // Английские
     'um', 'uh', 'uhh', 'uhm', 'hmm', 'hm', 'erm', 'err',
   ])
 
-  // Паттерны для regex-детекта: повторяющиеся гласные/согласные = звук-паразит
-  const FILLER_PATTERN = /^[эеаиуоыёэ]{1,2}$/i  // одна-две гласных = "э", "е", "а"
+  // Только повторяющиеся гласные (2+ символа) — "ааа", "эээ", но не одиночные "а"/"е"
+  const FILLER_PATTERN = /^[эеаиуоыё]{2,}$/i
 
   const MIN_PAUSE = 0.45   // паузы длиннее 0.45с вырезаем (было 0.65)
   const KEEP_PAUSE = 0.15  // оставляем небольшую паузу для естественности
 
-  // Максимальная длительность слова-паразита — защита от случайных совпадений
-  const MAX_FILLER_DURATION = 1.5
+  // Паразит должен длиться >= 0.25с — защита от нарезки реальных коротких слов
+  const MIN_FILLER_DURATION = 0.25
+  const MAX_FILLER_DURATION = 2.0
 
   const segments = []
 
@@ -286,9 +288,8 @@ function detectFillerSegments(words) {
     const clean = w.word.toLowerCase().replace(/[.,!?…\-–]/g, '').trim()
     const duration = w.end - w.start
 
-    // Слово-паразит: по списку или по паттерну коротких звуков
     const isFiller = FILLER_WORDS.has(clean) || FILLER_PATTERN.test(clean)
-    if (isFiller && duration <= MAX_FILLER_DURATION) {
+    if (isFiller && duration >= MIN_FILLER_DURATION && duration <= MAX_FILLER_DURATION) {
       // Добавляем небольшой отступ чтобы не обрезать соседние слова
       segments.push({
         start: Math.max(0, w.start - 0.02),
@@ -445,7 +446,8 @@ function detectSilenceSegments(videoPath) {
     let currentStart = null
 
     ffmpeg(videoPath)
-      .outputOptions(['-af', 'silencedetect=noise=-38dB:duration=0.2', '-f', 'null'])
+      // -45dB и 0.35с — только явные паузы, не случайные переходы между слогами
+      .outputOptions(['-af', 'silencedetect=noise=-45dB:duration=0.35', '-f', 'null'])
       .output('/dev/null')
       .on('stderr', (line) => {
         const startMatch = line.match(/silence_start: ([\d.]+)/)
@@ -454,8 +456,8 @@ function detectSilenceSegments(videoPath) {
         if (endMatch && currentStart !== null) {
           const end = parseFloat(endMatch[1])
           const duration = end - currentStart
-          // Только короткие тишины (0.2–0.8с) — паузы-паразиты, не естественные паузы
-          if (duration >= 0.2 && duration <= 0.8) {
+          // Только паузы 0.35–1.5с — явные паузы-паразиты
+          if (duration >= 0.35 && duration <= 1.5) {
             silences.push({ start: currentStart, end })
           }
           currentStart = null
@@ -538,7 +540,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
   for (let i = 0; i < clean.length; i += WORDS_PER_LINE) {
     const chunk = clean.slice(i, i + WORDS_PER_LINE)
     if (!chunk.length) continue
-    const text = chunk.map(w => w.word).join('').replace(/\s+/g, ' ').trim()
+    const text = chunk.map(w => w.word.trim()).filter(Boolean).join(' ')
     if (!text) continue
     const startT = assTime(chunk[0].start)
     const endT   = assTime(chunk[chunk.length - 1].end)

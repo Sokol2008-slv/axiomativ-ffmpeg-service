@@ -383,9 +383,15 @@ async function applyFilters(inputPath, outputPath, options) {
     const cmd = ffmpeg(inputPath)
       .outputOptions([
         '-c:v', 'libx264',
+        '-profile:v', 'high',
+        '-level:v', '4.0',
         '-preset', 'fast',
         '-crf', '22',
-        '-c:a', 'copy',
+        '-pix_fmt', 'yuv420p',   // максимальная совместимость
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-movflags', '+faststart',
+        '-threads', '2',
       ])
 
     if (filterStr) {

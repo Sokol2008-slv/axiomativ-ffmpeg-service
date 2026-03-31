@@ -50,10 +50,21 @@ app.get('/health', (req, res) => {
 
 // ── Прямая загрузка видео с браузера → обработка ─────────────────────────────
 app.post('/upload', upload.single('file'), async (req, res) => {
+  // Верифицируем Supabase JWT пользователя
   const authHeader = req.headers.authorization
-  if (authHeader !== `Bearer ${SECRET}`) {
+  const token = authHeader?.replace('Bearer ', '')
+
+  if (!token) {
     if (req.file) fs.rmSync(path.dirname(req.file.path), { recursive: true, force: true })
-    return res.status(401).json({ error: 'Unauthorized' })
+    return res.status(401).json({ error: 'No token provided' })
+  }
+
+  const supabase = getSupabase()
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token)
+
+  if (authError || !user) {
+    if (req.file) fs.rmSync(path.dirname(req.file.path), { recursive: true, force: true })
+    return res.status(401).json({ error: 'Invalid or expired token' })
   }
 
   if (!req.file) {
@@ -67,20 +78,15 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   } catch { /* ignore */ }
 
   const {
-    userId,
     optFillers = true,
     optSubtitles = true,
     optSubtitlesLang = 'auto',
     optColor = true,
   } = options
 
-  if (!userId) {
-    fs.rmSync(path.dirname(req.file.path), { recursive: true, force: true })
-    return res.status(400).json({ error: 'userId required in x-job-options' })
-  }
+  const userId = user.id  // берём из верифицированного JWT
 
   // Создаём джоб в Supabase
-  const supabase = getSupabase()
   const { data: job, error: jobErr } = await supabase
     .from('video_jobs')
     .insert({

@@ -293,8 +293,8 @@ function detectFillerSegments(words) {
   const MIN_PAUSE = 0.45
   const KEEP_PAUSE = 0.15
 
-  // Минимальная длительность: 0.22с — короче это реальное слово, не звук-паразит
-  const MIN_FILLER_DURATION = 0.22
+  // Минимальная длительность: 0.4с — только ДЛИННЫЕ "э-э-э", короткие не трогаем
+  const MIN_FILLER_DURATION = 0.40
   const MAX_FILLER_DURATION = 2.5
 
   const segments = []

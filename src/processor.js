@@ -111,22 +111,40 @@ export async function processVideoJob(jobId, userId) {
     if (uploadErr) throw new Error(`Upload failed: ${uploadErr.message}`)
     console.log(`[${jobId}] Uploaded result: ${resultStoragePath}`)
 
-    // 8. Получаем публичный URL (signed на 7 дней)
+    // 8. Удаляем оригинальный файл — он больше не нужен
+    await supabase.storage.from('videos').remove([job.storage_path])
+    console.log(`[${jobId}] Deleted original: ${job.storage_path}`)
+
+    // 9. Signed URL на 24 часа (достаточно чтобы скачать)
+    const EXPIRES_IN = 60 * 60 * 24  // 24 часа
     const { data: resultSigned } = await supabase.storage
       .from('videos')
-      .createSignedUrl(resultStoragePath, 60 * 60 * 24 * 7)
+      .createSignedUrl(resultStoragePath, EXPIRES_IN)
 
     const resultUrl = resultSigned?.signedUrl || null
+    const expiresAt = new Date(Date.now() + EXPIRES_IN * 1000).toISOString()
 
-    // 9. Статус → done
+    // 10. Статус → done
     await supabase.from('video_jobs').update({
       status: 'done',
       result_url: resultUrl,
       result_path: resultStoragePath,
       finished_at: new Date().toISOString(),
+      expires_at: expiresAt,
     }).eq('id', jobId)
 
-    console.log(`[${jobId}] Done! Result: ${resultUrl}`)
+    console.log(`[${jobId}] Done! Expires at: ${expiresAt}`)
+
+    // 11. Планируем удаление обработанного файла через 24 часа
+    // (неблокирующий setTimeout — Railway держит процесс живым)
+    setTimeout(async () => {
+      try {
+        await supabase.storage.from('videos').remove([resultStoragePath])
+        console.log(`[${jobId}] Auto-deleted processed file after 24h`)
+      } catch (e) {
+        console.warn(`[${jobId}] Failed to auto-delete processed file:`, e)
+      }
+    }, EXPIRES_IN * 1000)
 
   } catch (err) {
     console.error(`[${jobId}] Error:`, err)

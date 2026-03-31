@@ -368,22 +368,24 @@ async function applyFilters(inputPath, outputPath, options) {
 
   const vFilters = []
 
-  // Цветокоррекция
+  // Цветокоррекция — мягкая, как в Instagram/Reels (не перекручивать)
   if (color) {
-    // Насыщенность +30%, контраст +5%, небольшое осветление, чуть тепло
-    vFilters.push('eq=saturation=1.30:contrast=1.05:brightness=0.02:gamma=0.97')
-    // Лёгкое повышение резкости
-    vFilters.push('unsharp=3:3:0.4')
-    // Тёплый тон (чуть поднимаем красный, убираем синий)
-    vFilters.push('colorbalance=rs=0.03:gs=0.0:bs=-0.03')
+    // Чуть поднимаем насыщенность и контраст — едва заметно
+    vFilters.push('eq=saturation=1.10:contrast=1.02:brightness=0.01:gamma=1.0')
+    // Минимальная резкость
+    vFilters.push('unsharp=3:3:0.2')
   }
 
-  // Субтитры — должны идти ПОСЛЕДНИМИ (после цветокоррекции)
+  // Субтитры — Instagram/TikTok стиль: белый текст, тёмный контур, внизу
   if (srtPath) {
-    // Экранируем путь для FFmpeg
     const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:')
+    // FontSize=13 — компактно для вертикального 1080p
+    // Без BackColour (нет чёрного фона-прямоугольника)
+    // Outline=1.5 — чёрный контур для читаемости
+    // Shadow=1 — лёгкая тень
+    // MarginV=60 — немного выше нижнего края
     vFilters.push(
-      `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=22,Bold=1,Outline=2,Shadow=0,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,Alignment=2,MarginV=30'`
+      `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=13,Bold=1,Italic=0,Outline=1.5,Shadow=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,Alignment=2,MarginV=60'`
     )
   }
 

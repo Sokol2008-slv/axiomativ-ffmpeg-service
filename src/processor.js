@@ -90,25 +90,36 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
       console.log(`[${jobId}] Transcribing with Whisper...`)
       const transcriptResult = await transcribeWithWhisper(currentPath, job.opt_subtitles_lang)
       wordTimestamps = transcriptResult.words || []
-
-      // Генерируем SRT если нужны субтитры
-      if (job.opt_subtitles && wordTimestamps.length > 0) {
-        srtPath = path.join(tmpDir, 'subtitles.srt')
-        generateSRT(wordTimestamps, srtPath)
-        console.log(`[${jobId}] SRT generated: ${srtPath}`)
-      }
+      console.log(`[${jobId}] Whisper got ${wordTimestamps.length} words`)
     }
 
     // 5. Удаляем паузы и слова-паразиты
-    if (job.opt_fillers && wordTimestamps.length > 0) {
+    let cutSegments = []
+    if (job.opt_fillers) {
       const outputPath = path.join(tmpDir, `no_fillers.mp4`)
-      const cutSegments = detectFillerSegments(wordTimestamps)
-      console.log(`[${jobId}] Cutting ${cutSegments.length} filler segments...`)
-      await cutFillers(currentPath, outputPath, cutSegments)
-      currentPath = outputPath
+      // Детект по Whisper timestamps
+      const whisperCuts = wordTimestamps.length > 0 ? detectFillerSegments(wordTimestamps) : []
+      // Детект тишины через FFmpeg (ловит "э" которые Whisper пропустил)
+      const silenceCuts = await detectSilenceSegments(currentPath)
+      // Объединяем оба метода
+      cutSegments = mergeSegments([...whisperCuts, ...silenceCuts])
+      console.log(`[${jobId}] Cutting ${cutSegments.length} segments (${whisperCuts.length} whisper + ${silenceCuts.length} silence)`)
+      if (cutSegments.length > 0) {
+        await cutFillers(currentPath, outputPath, cutSegments)
+        currentPath = outputPath
+      }
     }
 
-    // 6. Субтитры + цветокоррекция (один проход FFmpeg)
+    // 6. Генерируем SRT ПОСЛЕ вырезания — чтобы таймстемпы совпадали с новым видео
+    if (job.opt_subtitles && wordTimestamps.length > 0) {
+      // Корректируем таймстемпы слов с учётом вырезанных сегментов
+      const adjustedWords = adjustWordTimestamps(wordTimestamps, cutSegments)
+      srtPath = path.join(tmpDir, 'subtitles.srt')
+      generateSRT(adjustedWords, srtPath)
+      console.log(`[${jobId}] SRT generated: ${srtPath} (${adjustedWords.length} words)`)
+    }
+
+    // 7. Субтитры + цветокоррекция (один проход FFmpeg)
     if (job.opt_subtitles || job.opt_color) {
       const outputPath = path.join(tmpDir, `processed.mp4`)
       console.log(`[${jobId}] Applying: subs=${job.opt_subtitles}, color=${job.opt_color}`)
@@ -432,19 +443,80 @@ async function applyFilters(inputPath, outputPath, options) {
   })
 }
 
+// ── Детект тишины через FFmpeg (для "э" которые Whisper пропустил) ──────────
+function detectSilenceSegments(videoPath) {
+  return new Promise((resolve) => {
+    const silences = []
+    let currentStart = null
+
+    ffmpeg(videoPath)
+      .outputOptions(['-af', 'silencedetect=noise=-38dB:duration=0.2', '-f', 'null'])
+      .output('/dev/null')
+      .on('stderr', (line) => {
+        const startMatch = line.match(/silence_start: ([\d.]+)/)
+        const endMatch = line.match(/silence_end: ([\d.]+)/)
+        if (startMatch) currentStart = parseFloat(startMatch[1])
+        if (endMatch && currentStart !== null) {
+          const end = parseFloat(endMatch[1])
+          const duration = end - currentStart
+          // Только короткие тишины (0.2–0.8с) — паузы-паразиты, не естественные паузы
+          if (duration >= 0.2 && duration <= 0.8) {
+            silences.push({ start: currentStart, end })
+          }
+          currentStart = null
+        }
+      })
+      .on('end', () => resolve(silences))
+      .on('error', () => resolve([])) // если ошибка — просто пустой список
+      .run()
+  })
+}
+
+// ── Корректировка таймстемпов слов после вырезания сегментов ─────────────────
+// КРИТИЧНО: без этого субтитры будут смещены после фильтрации
+function adjustWordTimestamps(words, cutSegments) {
+  if (!cutSegments.length) return words
+
+  return words
+    .filter(w => {
+      // Убираем слова которые полностью попали в вырезанный сегмент
+      return !cutSegments.some(c => w.start >= c.start && w.end <= c.end + 0.1)
+    })
+    .map(w => {
+      // Считаем сколько времени вырезано ДО этого слова
+      let cutBefore = 0
+      for (const c of cutSegments) {
+        if (c.end <= w.start) {
+          cutBefore += c.end - c.start
+        } else if (c.start < w.start) {
+          cutBefore += w.start - c.start
+        }
+      }
+      return {
+        ...w,
+        start: Math.max(0, w.start - cutBefore),
+        end: Math.max(0, w.end - cutBefore),
+      }
+    })
+}
+
 // ── Генерация SRT файла ──────────────────────────────────────────────────────
+// Instagram/TikTok стиль: 3 слова на строку, короткие тайтлы
 function generateSRT(words, outputPath) {
-  const WORDS_PER_LINE = 7
+  const WORDS_PER_LINE = 3
   const lines = []
   let idx = 1
 
-  for (let i = 0; i < words.length; i += WORDS_PER_LINE) {
-    const chunk = words.slice(i, i + WORDS_PER_LINE)
+  // Фильтруем пустые/мусорные слова
+  const clean = words.filter(w => w.word && w.word.trim().length > 0)
+
+  for (let i = 0; i < clean.length; i += WORDS_PER_LINE) {
+    const chunk = clean.slice(i, i + WORDS_PER_LINE)
     if (!chunk.length) continue
 
     const startSec = chunk[0].start
     const endSec = chunk[chunk.length - 1].end
-    const text = chunk.map(w => w.word).join(' ').trim()
+    const text = chunk.map(w => w.word).join('').replace(/\s+/g, ' ').trim()
 
     if (!text) continue
 

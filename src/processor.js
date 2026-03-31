@@ -197,12 +197,12 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
 }
 
 // ── Транскрипция через Whisper ──────────────────────────────────────────────
-// Whisper API принимает максимум 25 МБ — сначала извлекаем аудио через FFmpeg
+// Whisper API: максимум 25 МБ — сначала извлекаем аудио (AAC/m4a, без MP3!)
 async function transcribeWithWhisper(videoPath, language) {
   const openai = getOpenAI()
 
-  // Извлекаем аудио в mp3 (mono, 64k) — обычно < 10 МБ для видео до часа
-  const audioPath = videoPath.replace(/\.[^/.]+$/, '') + '_audio.mp3'
+  // .m4a (AAC) — всегда есть в FFmpeg, в отличие от libmp3lame
+  const audioPath = path.join(path.dirname(videoPath), 'whisper_audio.m4a')
   await extractAudio(videoPath, audioPath)
 
   try {
@@ -215,20 +215,19 @@ async function transcribeWithWhisper(videoPath, language) {
     })
     return response
   } finally {
-    // Удаляем временный аудиофайл
     try { fs.unlinkSync(audioPath) } catch { /* ignore */ }
   }
 }
 
 // Нормализация видео: scale до 1080p, конвертация в H.264 MP4
-// Снижает нагрузку на FFmpeg при дальнейшей обработке
 function normalizeVideo(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .outputOptions([
-        '-vf', 'scale=\'min(1920,iw)\':\'min(1080,ih)\':force_original_aspect_ratio=decrease',
+        // scale: ширина и высота не больше 1080, сохраняем пропорции
+        '-vf', 'scale=w=\'if(gt(iw,ih),min(1920,iw),-2)\':h=\'if(gt(ih,iw),min(1920,ih),-2)\'',
         '-c:v', 'libx264',
-        '-preset', 'ultrafast', // быстрее = меньше RAM
+        '-preset', 'ultrafast',
         '-crf', '23',
         '-c:a', 'aac',
         '-b:a', '128k',
@@ -237,20 +236,31 @@ function normalizeVideo(inputPath, outputPath) {
       ])
       .output(outputPath)
       .on('end', resolve)
-      .on('error', reject)
+      .on('error', (err) => {
+        // Fallback: простая конвертация без scale если vf упал
+        ffmpeg(inputPath)
+          .outputOptions(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-threads', '2'])
+          .output(outputPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run()
+      })
       .run()
   })
 }
 
-// Извлечение аудио в mp3 mono 64k
+// Извлечение аудио в m4a (AAC) mono 16kHz — для Whisper
+// AAC всегда доступен в FFmpeg (в отличие от libmp3lame)
 function extractAudio(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .outputOptions([
-        '-vn',          // без видео
-        '-ac', '1',     // mono
-        '-ar', '16000', // 16kHz — оптимально для Whisper
-        '-b:a', '64k',  // 64 kbps
+        '-vn',           // без видео
+        '-ac', '1',      // mono
+        '-ar', '16000',  // 16kHz — оптимально для Whisper
+        '-c:a', 'aac',   // AAC кодек
+        '-b:a', '64k',
       ])
       .output(outputPath)
       .on('end', resolve)

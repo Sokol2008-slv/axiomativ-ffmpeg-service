@@ -110,13 +110,14 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
       }
     }
 
-    // 6. Генерируем SRT ПОСЛЕ вырезания — чтобы таймстемпы совпадали с новым видео
+    // 6. Генерируем ASS ПОСЛЕ вырезания — чтобы таймстемпы совпадали с новым видео
     if (job.opt_subtitles && wordTimestamps.length > 0) {
-      // Корректируем таймстемпы слов с учётом вырезанных сегментов
       const adjustedWords = adjustWordTimestamps(wordTimestamps, cutSegments)
-      srtPath = path.join(tmpDir, 'subtitles.srt')
-      generateSRT(adjustedWords, srtPath)
-      console.log(`[${jobId}] SRT generated: ${srtPath} (${adjustedWords.length} words)`)
+      // Получаем размеры видео для точного масштабирования шрифта
+      const dims = await getVideoDimensions(currentPath)
+      srtPath = path.join(tmpDir, 'subtitles.ass')
+      generateASS(adjustedWords, srtPath, dims.width, dims.height)
+      console.log(`[${jobId}] ASS generated: ${srtPath} (${adjustedWords.length} words, ${dims.width}x${dims.height})`)
     }
 
     // 7. Субтитры + цветокоррекция (один проход FFmpeg)
@@ -323,10 +324,8 @@ function mergeSegments(segs) {
   return merged
 }
 
-// ── Вырезаем паузы/паразиты через FFmpeg ────────────────────────────────────
+// ── Вырезаем паузы/паразиты через FFmpeg (с audio fade для плавности) ───────
 async function cutFillers(inputPath, outputPath, cutSegments) {
-  // Строим список "хороших" сегментов (всё что НЕ в cutSegments)
-  // Получаем длительность видео
   const duration = await getVideoDuration(inputPath)
   const keepSegments = invertSegments(cutSegments, duration)
 
@@ -335,16 +334,19 @@ async function cutFillers(inputPath, outputPath, cutSegments) {
     return
   }
 
-  // Строим filter_complex для concat
-  // [0:v]trim=start=X:end=Y,setpts=PTS-STARTPTS[vN]
-  // [0:a]atrim=start=X:end=Y,asetpts=PTS-STARTPTS[aN]
-  // [v0][a0][v1][a1]...concat=n=N:v=1:a=1[outv][outa]
+  const FADE = 0.035 // 35мс аудио-фейд на каждом разрезе — убирает щелчки
+
   const vParts = keepSegments.map((s, i) =>
     `[0:v]trim=start=${s.start}:end=${s.end},setpts=PTS-STARTPTS[v${i}]`
   )
-  const aParts = keepSegments.map((s, i) =>
-    `[0:a]atrim=start=${s.start}:end=${s.end},asetpts=PTS-STARTPTS[a${i}]`
-  )
+  const aParts = keepSegments.map((s, i) => {
+    const segDur = s.end - s.start
+    const fadeIn  = i > 0 ? `,afade=t=in:ss=0:d=${FADE}` : ''
+    const fadeOut = i < keepSegments.length - 1
+      ? `,afade=t=out:st=${Math.max(0, segDur - FADE)}:d=${FADE}`
+      : ''
+    return `[0:a]atrim=start=${s.start}:end=${s.end},asetpts=PTS-STARTPTS${fadeIn}${fadeOut}[a${i}]`
+  })
   const inputs = keepSegments.map((_, i) => `[v${i}][a${i}]`).join('')
   const concatFilter = `${inputs}concat=n=${keepSegments.length}:v=1:a=1[outv][outa]`
   const filterComplex = [...vParts, ...aParts, concatFilter].join(';')
@@ -401,17 +403,10 @@ async function applyFilters(inputPath, outputPath, options) {
     vFilters.push('unsharp=3:3:0.2')
   }
 
-  // Субтитры — Instagram/TikTok стиль: белый текст, тёмный контур, внизу
+  // Субтитры — используем ASS фильтр (точный контроль размера под разрешение)
   if (srtPath) {
-    const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:')
-    // FontSize=13 — компактно для вертикального 1080p
-    // Без BackColour (нет чёрного фона-прямоугольника)
-    // Outline=1.5 — чёрный контур для читаемости
-    // Shadow=1 — лёгкая тень
-    // MarginV=60 — немного выше нижнего края
-    vFilters.push(
-      `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=13,Bold=1,Italic=0,Outline=1.5,Shadow=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,Alignment=2,MarginV=60'`
-    )
+    const escapedAss = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:')
+    vFilters.push(`ass='${escapedAss}'`)
   }
 
   const filterStr = vFilters.join(',')
@@ -500,33 +495,65 @@ function adjustWordTimestamps(words, cutSegments) {
     })
 }
 
-// ── Генерация SRT файла ──────────────────────────────────────────────────────
-// Instagram/TikTok стиль: 3 слова на строку, короткие тайтлы
-function generateSRT(words, outputPath) {
-  const WORDS_PER_LINE = 3
-  const lines = []
-  let idx = 1
+// ── Размеры видео ────────────────────────────────────────────────────────────
+function getVideoDimensions(videoPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(videoPath, (err, meta) => {
+      if (err) return reject(err)
+      const vs = meta.streams.find(s => s.codec_type === 'video')
+      resolve({ width: vs?.width || 1080, height: vs?.height || 1920 })
+    })
+  })
+}
 
-  // Фильтруем пустые/мусорные слова
+// ── Генерация ASS субтитров (Instagram/Reels стиль) ──────────────────────────
+// ASS формат позволяет точно задать FontSize относительно реального разрешения
+function generateASS(words, outputPath, videoWidth = 1080, videoHeight = 1920) {
+  const WORDS_PER_LINE = 3
+
+  // FontSize: ~5.5% высоты видео → красиво для любого разрешения
+  const fontSize = Math.round(videoHeight * 0.055)
+  // Отступ снизу: ~7% высоты
+  const marginV = Math.round(videoHeight * 0.07)
+
+  // ASS цвета: &HAABBGGRR (alpha, blue, green, red)
+  // Белый текст, чёрный контур, без фона
+  const header = `[Script Info]
+ScriptType: v4.00+
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+PlayResX: ${videoWidth}
+PlayResY: ${videoHeight}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Liberation Sans,${fontSize},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0.3,0,1,2.5,1.0,2,40,40,${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
+
   const clean = words.filter(w => w.word && w.word.trim().length > 0)
+  const dialogues = []
 
   for (let i = 0; i < clean.length; i += WORDS_PER_LINE) {
     const chunk = clean.slice(i, i + WORDS_PER_LINE)
     if (!chunk.length) continue
-
-    const startSec = chunk[0].start
-    const endSec = chunk[chunk.length - 1].end
     const text = chunk.map(w => w.word).join('').replace(/\s+/g, ' ').trim()
-
     if (!text) continue
-
-    lines.push(
-      `${idx}\n${srtTime(startSec)} --> ${srtTime(endSec)}\n${text}\n`
-    )
-    idx++
+    const startT = assTime(chunk[0].start)
+    const endT   = assTime(chunk[chunk.length - 1].end)
+    dialogues.push(`Dialogue: 0,${startT},${endT},Default,,0,0,0,,${text}`)
   }
 
-  fs.writeFileSync(outputPath, lines.join('\n'), 'utf8')
+  fs.writeFileSync(outputPath, header + '\n' + dialogues.join('\n'), 'utf8')
+}
+
+function assTime(sec) {
+  const h  = Math.floor(sec / 3600)
+  const m  = Math.floor((sec % 3600) / 60)
+  const s  = Math.floor(sec % 60)
+  const cs = Math.round((sec % 1) * 100)
+  return `${h}:${pad(m)}:${pad(s)}.${pad(cs)}`
 }
 
 function srtTime(sec) {

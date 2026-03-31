@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "nodejs_20"]
+nixPkgs = ["ffmpeg", "nodejs_20", "liberation_ttf", "fontconfig"]
 
 [phases.install]
-cmds = ["npm install"]
+cmds = ["npm install", "fc-cache -fv 2>/dev/null || true"]
 
 [start]
 cmd = "npm start"

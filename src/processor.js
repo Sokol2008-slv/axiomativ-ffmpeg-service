@@ -272,24 +272,30 @@ function extractAudio(inputPath, outputPath) {
 // ── Детект слов-паразитов и пауз ────────────────────────────────────────────
 function detectFillerSegments(words) {
   const FILLER_WORDS = new Set([
-    // Только однозначные звуки-паразиты (НЕ однобуквенные — "е"/"а"/"є" = реальные слова!)
+    // Эканье — главный враг (е/э с длительностью >= 0.25с)
+    'е', 'э',
+    // Повторы
+    'ее', 'еее', 'ееее',
+    'ээ', 'эээ', 'эээ',
     'эм', 'эмм', 'эммм', 'эм-м',
     'ммм', 'мм', 'хм', 'хмм',
-    'ааа', 'аааа', 'ааааа',
-    'эээ', 'ээ',
+    'ааа', 'аааа',
     // Английские
-    'um', 'uh', 'uhh', 'uhm', 'hmm', 'hm', 'erm', 'err',
+    'um', 'uh', 'uhh', 'uhm', 'hmm', 'hm', 'erm',
+    // ЗАЩИЩЁННЫЕ (никогда не резать):
+    // 'є' (U+0454) — украинское "есть/являются" — НЕ в списке
+    // 'а'           — союз "а" — НЕ в списке
   ])
 
-  // Только повторяющиеся гласные (2+ символа) — "ааа", "эээ", но не одиночные "а"/"е"
-  const FILLER_PATTERN = /^[эеаиуоыё]{2,}$/i
+  // Regex: 1+ гласных подряд (е, э, ее, эээ...) — НО не "є" (другой символ U+0454)
+  const FILLER_PATTERN = /^[еэ]{1,}$/i
 
-  const MIN_PAUSE = 0.45   // паузы длиннее 0.45с вырезаем (было 0.65)
-  const KEEP_PAUSE = 0.15  // оставляем небольшую паузу для естественности
+  const MIN_PAUSE = 0.45
+  const KEEP_PAUSE = 0.15
 
-  // Паразит должен длиться >= 0.25с — защита от нарезки реальных коротких слов
-  const MIN_FILLER_DURATION = 0.25
-  const MAX_FILLER_DURATION = 2.0
+  // Минимальная длительность: 0.22с — короче это реальное слово, не звук-паразит
+  const MIN_FILLER_DURATION = 0.22
+  const MAX_FILLER_DURATION = 2.5
 
   const segments = []
 
@@ -456,8 +462,8 @@ function detectSilenceSegments(videoPath) {
     let currentStart = null
 
     ffmpeg(videoPath)
-      // -45dB и 0.35с — только явные паузы, не случайные переходы между слогами
-      .outputOptions(['-af', 'silencedetect=noise=-45dB:duration=0.35', '-f', 'null'])
+      // -42dB и 0.25с — ловим эканье и паузы, не режем слоги
+      .outputOptions(['-af', 'silencedetect=noise=-42dB:duration=0.25', '-f', 'null'])
       .output('/dev/null')
       .on('stderr', (line) => {
         const startMatch = line.match(/silence_start: ([\d.]+)/)
@@ -466,8 +472,8 @@ function detectSilenceSegments(videoPath) {
         if (endMatch && currentStart !== null) {
           const end = parseFloat(endMatch[1])
           const duration = end - currentStart
-          // Только паузы 0.35–1.5с — явные паузы-паразиты
-          if (duration >= 0.35 && duration <= 1.5) {
+          // Паузы 0.25–2с
+          if (duration >= 0.25 && duration <= 2.0) {
             silences.push({ start: currentStart, end })
           }
           currentStart = null

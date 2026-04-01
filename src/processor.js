@@ -157,7 +157,16 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
       currentPath = outputPath
     }
 
-    // 7. Загружаем результат в Supabase Storage
+    // 8. Авто-музыка: подбираем трек и миксуем
+    if (job.opt_music) {
+      const musicPath = path.join(tmpDir, 'with_music.mp4')
+      console.log(`[${jobId}] Applying auto-music...`)
+      await applyAutoMusic(currentPath, musicPath, wordTimestamps, tmpDir)
+      currentPath = musicPath
+      console.log(`[${jobId}] Music mixed`)
+    }
+
+    // 9. Загружаем результат в Supabase Storage
     const resultStoragePath = job.storage_path.replace(/^([^/]+\/[^/]+)/, '$1_processed')
     const fileBuffer = fs.readFileSync(currentPath)
 
@@ -292,6 +301,13 @@ export async function processClipsJob(jobId, userId, uploadedFilePath = null) {
         await applyFilters(processedClipPath, finalPath, { srtPath: assPath, color: job.opt_color })
       } else {
         fs.copyFileSync(processedClipPath, finalPath)
+      }
+
+      // Авто-музыка для клипа
+      if (job.opt_music) {
+        const musicClipPath = path.join(tmpDir, `clip_${i}_music.mp4`)
+        await applyAutoMusic(finalPath, musicClipPath, clipWords, tmpDir)
+        fs.copyFileSync(musicClipPath, finalPath)
       }
 
       // Загружаем в Storage
@@ -920,6 +936,107 @@ function prependHook(inputPath, outputPath, hook) {
       .on('error', reject)
       .run()
   })
+}
+
+// ── Авто-музыка: подбираем трек по настроению и миксуем ─────────────────────
+
+// Библиотека royalty-free треков по жанрам (Pixabay Free Music License)
+const MUSIC_LIBRARY = {
+  motivational: [
+    'https://cdn.pixabay.com/audio/2024/02/28/audio_2dde668d98.mp3',
+    'https://cdn.pixabay.com/audio/2023/10/30/audio_1c04c4feaa.mp3',
+  ],
+  calm: [
+    'https://cdn.pixabay.com/audio/2024/03/11/audio_e96d3ea793.mp3',
+    'https://cdn.pixabay.com/audio/2023/11/13/audio_928fbd4a77.mp3',
+  ],
+  happy: [
+    'https://cdn.pixabay.com/audio/2024/01/15/audio_a0f3a8e7f9.mp3',
+    'https://cdn.pixabay.com/audio/2023/09/25/audio_3b2e4a9c1d.mp3',
+  ],
+  dramatic: [
+    'https://cdn.pixabay.com/audio/2024/02/01/audio_5c8b3e2f1a.mp3',
+    'https://cdn.pixabay.com/audio/2023/12/05/audio_7d4c1b8e2f.mp3',
+  ],
+  corporate: [
+    'https://cdn.pixabay.com/audio/2024/01/20/audio_4f2e9c1b3d.mp3',
+    'https://cdn.pixabay.com/audio/2023/08/18/audio_6a3c2d5e1f.mp3',
+  ],
+}
+
+// GPT определяет настроение видео по транскрипту, возвращает ключ жанра
+async function detectMood(words) {
+  if (words.length < 5) return 'calm'
+  const openai = getOpenAI()
+  const sample = words.filter((_, i) => i % 5 === 0).map(w => w.word).join(' ')
+  try {
+    const r = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{
+        role: 'user',
+        content: `По тексту определи настроение видео. Выбери ОДНО слово из: motivational, calm, happy, dramatic, corporate.
+Текст: "${sample.slice(0, 500)}"
+Ответь только одним словом.`,
+      }],
+      max_tokens: 10,
+      temperature: 0,
+    })
+    const mood = r.choices[0]?.message?.content?.trim().toLowerCase() || 'calm'
+    return MUSIC_LIBRARY[mood] ? mood : 'calm'
+  } catch {
+    return 'calm'
+  }
+}
+
+// Микс фоновой музыки с оригинальным аудио
+// volume: 0.15 = 15% от громкости оригинала (слышно но не мешает)
+function mixMusic(inputPath, musicPath, outputPath, volume = 0.15) {
+  return new Promise((resolve, reject) => {
+    // amix: duration=first — обрезаем по длине видео
+    // aloop на музыке чтобы не закончилась раньше видео
+    const filterComplex = [
+      `[1:a]volume=${volume},aloop=loop=-1:size=2147483647[music]`,
+      `[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[outa]`,
+    ].join(';')
+
+    ffmpeg(inputPath)
+      .input(musicPath)
+      .outputOptions([
+        '-filter_complex', filterComplex,
+        '-map', '0:v',
+        '-map', '[outa]',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run()
+  })
+}
+
+// Полный пайплайн авто-музыки: определить жанр → скачать трек → смикшировать
+async function applyAutoMusic(videoPath, outputPath, words, tmpDir) {
+  const mood = await detectMood(words)
+  const tracks = MUSIC_LIBRARY[mood]
+  const trackUrl = tracks[Math.floor(Math.random() * tracks.length)]
+  console.log(`Auto-music: mood=${mood}, track=${trackUrl}`)
+
+  const musicPath = path.join(tmpDir, 'music.mp3')
+  try {
+    await downloadFile(trackUrl, musicPath)
+  } catch (e) {
+    console.warn('Music download failed, skipping:', e.message)
+    fs.copyFileSync(videoPath, outputPath)
+    return
+  }
+
+  try {
+    await mixMusic(videoPath, musicPath, outputPath)
+  } finally {
+    try { fs.unlinkSync(musicPath) } catch { /* ignore */ }
+  }
 }
 
 // ── Авто-кадрирование в 9:16 (вертикальный формат для Reels/TikTok) ──────────

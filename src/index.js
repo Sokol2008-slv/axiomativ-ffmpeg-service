@@ -135,6 +135,53 @@ app.post('/process', async (req, res) => {
   })
 })
 
-app.listen(PORT, () => {
+// ── Отмена джоба (статус queued → cancelled) ─────────────────────────────────
+app.post('/cancel', async (req, res) => {
+  const authHeader = req.headers.authorization
+  const token = authHeader?.replace('Bearer ', '')
+  if (!token) return res.status(401).json({ error: 'No token' })
+
+  const supabase = getSupabase()
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token)
+  if (authError || !user) return res.status(401).json({ error: 'Invalid token' })
+
+  const { jobId } = req.body
+  if (!jobId) return res.status(400).json({ error: 'jobId required' })
+
+  const { error } = await supabase
+    .from('video_jobs')
+    .update({ status: 'error', error_message: 'Отменено пользователем', finished_at: new Date().toISOString() })
+    .eq('id', jobId)
+    .eq('user_id', user.id)
+    .eq('status', 'queued') // только queued, нельзя отменить processing
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.json({ ok: true })
+})
+
+app.listen(PORT, async () => {
   console.log(`FFmpeg service running on port ${PORT}`)
+
+  // При старте — сбрасываем джобы застрявшие в processing/queued (Railway рестарт)
+  try {
+    const supabase = getSupabase()
+    const { data: stuckJobs } = await supabase
+      .from('video_jobs')
+      .select('id')
+      .in('status', ['processing', 'queued'])
+
+    if (stuckJobs?.length) {
+      await supabase
+        .from('video_jobs')
+        .update({
+          status: 'error',
+          error_message: 'Сервис перезапустился во время обработки. Попробуйте ещё раз.',
+          finished_at: new Date().toISOString(),
+        })
+        .in('id', stuckJobs.map(j => j.id))
+      console.log(`Recovered ${stuckJobs.length} stuck jobs on startup`)
+    }
+  } catch (e) {
+    console.warn('Startup recovery failed:', e.message)
+  }
 })

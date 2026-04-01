@@ -6,7 +6,6 @@ import fs from 'fs'
 import path from 'path'
 import os from 'os'
 import { randomUUID } from 'crypto'
-import { Readable } from 'stream'
 import { execSync } from 'child_process'
 
 // Используем системный ffmpeg (nixpkgs) — он собран с libass/subtitles.
@@ -572,14 +571,6 @@ function assTime(sec) {
   const s  = Math.floor(sec % 60)
   const cs = Math.round((sec % 1) * 100)
   return `${h}:${pad(m)}:${pad(s)}.${pad(cs)}`
-}
-
-function srtTime(sec) {
-  const h = Math.floor(sec / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const s = Math.floor(sec % 60)
-  const ms = Math.round((sec % 1) * 1000)
-  return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`
 }
 
 function pad(n, len = 2) {

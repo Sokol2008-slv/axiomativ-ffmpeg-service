@@ -85,6 +85,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     optHook = false,
     optClips = false,
     optClipsCount = 5,
+    optReframe = false,
   } = options
 
   const userId = user.id  // берём из верифицированного JWT
@@ -105,6 +106,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       opt_hook: optHook,
       opt_clips: optClips,
       opt_clips_count: optClipsCount,
+      opt_reframe: optReframe,
     })
     .select()
     .single()

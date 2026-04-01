@@ -81,7 +81,16 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
     await normalizeVideo(inputPath, normalizedPath)
     let currentPath = normalizedPath
 
-    // 4. Транскрипция через Whisper (если нужны субтитры или удаление пауз)
+    // 4. Авто-кадрирование в 9:16 (если горизонтальное видео)
+    if (job.opt_reframe) {
+      const reframedPath = path.join(tmpDir, 'reframed.mp4')
+      console.log(`[${jobId}] Reframing to 9:16...`)
+      await reframeToVertical(currentPath, reframedPath)
+      currentPath = reframedPath
+      console.log(`[${jobId}] Reframe done`)
+    }
+
+    // 5. Транскрипция через Whisper (если нужны субтитры или удаление пауз)
     let wordTimestamps = []
     let srtPath = null
 
@@ -256,6 +265,14 @@ export async function processClipsJob(jobId, userId, uploadedFilePath = null) {
       // Вырезаем сегмент
       await extractClip(normalizedPath, clipPath, seg.start, seg.end)
 
+      // Авто-кадрирование в 9:16
+      let processedClipPath = clipPath
+      if (job.opt_reframe) {
+        const reframedClipPath = path.join(tmpDir, `clip_${i}_reframed.mp4`)
+        await reframeToVertical(clipPath, reframedClipPath)
+        processedClipPath = reframedClipPath
+      }
+
       // Слова для этого сегмента
       const clipWords = words
         .filter(w => w.start >= seg.start && w.end <= seg.end)
@@ -264,7 +281,7 @@ export async function processClipsJob(jobId, userId, uploadedFilePath = null) {
       // Субтитры
       let assPath = null
       if (job.opt_subtitles && clipWords.length > 0) {
-        const dims = await getVideoDimensions(clipPath)
+        const dims = await getVideoDimensions(processedClipPath)
         assPath = path.join(tmpDir, `clip_${i}.ass`)
         generateASS(clipWords, assPath, dims.width, dims.height)
       }
@@ -272,9 +289,9 @@ export async function processClipsJob(jobId, userId, uploadedFilePath = null) {
       // Цветокоррекция + субтитры
       const finalPath = path.join(tmpDir, `clip_${i}_final.mp4`)
       if (job.opt_subtitles || job.opt_color) {
-        await applyFilters(clipPath, finalPath, { srtPath: assPath, color: job.opt_color })
+        await applyFilters(processedClipPath, finalPath, { srtPath: assPath, color: job.opt_color })
       } else {
-        fs.copyFileSync(clipPath, finalPath)
+        fs.copyFileSync(processedClipPath, finalPath)
       }
 
       // Загружаем в Storage
@@ -902,6 +919,50 @@ function prependHook(inputPath, outputPath, hook) {
       .on('end', resolve)
       .on('error', reject)
       .run()
+  })
+}
+
+// ── Авто-кадрирование в 9:16 (вертикальный формат для Reels/TikTok) ──────────
+// Если видео горизонтальное — размываем фон и вписываем поверх него
+function reframeToVertical(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(inputPath, (err, meta) => {
+      if (err) return reject(err)
+      const vs = meta.streams.find(s => s.codec_type === 'video')
+      const w = vs?.width || 1920
+      const h = vs?.height || 1080
+
+      // Уже вертикальное (portrait) — просто копируем
+      if (h >= w) {
+        fs.copyFileSync(inputPath, outputPath)
+        return resolve()
+      }
+
+      // Горизонтальное → blur pad: размытый фон + видео по центру
+      // Фон: масштабируем чтобы заполнить 1080x1920, обрезаем, размываем
+      // Передний план: масштабируем чтобы вписаться в 1080x1920, накладываем по центру
+      const filterComplex = [
+        '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[bg_raw]',
+        '[bg_raw]gblur=sigma=25[bg_blur]',
+        '[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]',
+        '[bg_blur][fg]overlay=(W-w)/2:(H-h)/2[out]',
+      ].join(';')
+
+      ffmpeg(inputPath)
+        .outputOptions([
+          '-filter_complex', filterComplex,
+          '-map', '[out]',
+          '-map', '0:a?',
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-crf', '23',
+          '-c:a', 'copy',
+        ])
+        .output(outputPath)
+        .on('end', resolve)
+        .on('error', reject)
+        .run()
+    })
   })
 }
 

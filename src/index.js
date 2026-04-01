@@ -4,7 +4,7 @@ import multer from 'multer'
 import os from 'os'
 import path from 'path'
 import fs from 'fs'
-import { processVideoJob } from './processor.js'
+import { processVideoJob, processClipsJob } from './processor.js'
 import { createClient } from '@supabase/supabase-js'
 import { randomUUID } from 'crypto'
 
@@ -83,6 +83,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     optSubtitlesLang = 'auto',
     optColor = true,
     optHook = false,
+    optClips = false,
+    optClipsCount = 5,
   } = options
 
   const userId = user.id  // берём из верифицированного JWT
@@ -101,6 +103,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       opt_subtitles_lang: optSubtitlesLang,
       opt_color: optColor,
       opt_hook: optHook,
+      opt_clips: optClips,
+      opt_clips_count: optClipsCount,
     })
     .select()
     .single()
@@ -114,9 +118,15 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   res.json({ ok: true, jobId: job.id })
 
   // Обрабатываем асинхронно с уже скачанным файлом
-  processVideoJob(job.id, userId, req.file.path).catch(err => {
-    console.error(`[Job ${job.id}] Fatal:`, err)
-  })
+  if (optClips) {
+    processClipsJob(job.id, userId, req.file.path).catch(err => {
+      console.error(`[Job ${job.id}] Fatal:`, err)
+    })
+  } else {
+    processVideoJob(job.id, userId, req.file.path).catch(err => {
+      console.error(`[Job ${job.id}] Fatal:`, err)
+    })
+  }
 })
 
 // ── Вызов из Inngest (если нужно) ─────────────────────────────────────────────

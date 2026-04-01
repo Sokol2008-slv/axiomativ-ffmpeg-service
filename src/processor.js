@@ -205,6 +205,236 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
   }
 }
 
+// ── Режим нарезки на клипы ───────────────────────────────────────────────────
+export async function processClipsJob(jobId, userId, uploadedFilePath = null) {
+  const supabase = getSupabase()
+  const tmpDir = uploadedFilePath
+    ? path.dirname(uploadedFilePath)
+    : path.join(os.tmpdir(), `job_${jobId}_${randomUUID()}`)
+
+  if (!uploadedFilePath) fs.mkdirSync(tmpDir, { recursive: true })
+  console.log(`[${jobId}] CLIPS MODE: starting in ${tmpDir}`)
+
+  try {
+    const { data: job } = await supabase.from('video_jobs').select('*').eq('id', jobId).eq('user_id', userId).single()
+    if (!job) throw new Error(`Job not found: ${jobId}`)
+
+    await supabase.from('video_jobs').update({ status: 'processing', started_at: new Date().toISOString() }).eq('id', jobId)
+
+    // Берём файл
+    let inputPath = uploadedFilePath && fs.existsSync(uploadedFilePath) ? uploadedFilePath : null
+    if (!inputPath) {
+      const { data: signed } = await supabase.storage.from('videos').createSignedUrl(job.storage_path, 3600)
+      inputPath = path.join(tmpDir, `input_${Date.now()}.mp4`)
+      await downloadFile(signed.signedUrl, inputPath)
+    }
+
+    // Нормализуем
+    const normalizedPath = path.join(tmpDir, 'normalized.mp4')
+    await normalizeVideo(inputPath, normalizedPath)
+    const totalDuration = await getVideoDuration(normalizedPath)
+    console.log(`[${jobId}] Duration: ${totalDuration.toFixed(0)}s`)
+
+    // Транскрибируем с поддержкой длинных видео (чанками по 20 мин)
+    const words = await transcribeWithChunking(normalizedPath, job.opt_subtitles_lang, totalDuration)
+    console.log(`[${jobId}] Total words: ${words.length}`)
+
+    // GPT находит лучшие сегменты
+    const clipsCount = job.opt_clips_count || 5
+    const segments = await findBestClipSegments(words, totalDuration, clipsCount)
+    console.log(`[${jobId}] Found ${segments.length} clip segments`)
+
+    // Обрабатываем каждый клип
+    const EXPIRES_IN = 60 * 60 * 24
+    const resultClips = []
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
+      const clipPath = path.join(tmpDir, `clip_${i}.mp4`)
+      console.log(`[${jobId}] Processing clip ${i + 1}/${segments.length}: ${seg.start.toFixed(0)}s–${seg.end.toFixed(0)}s`)
+
+      // Вырезаем сегмент
+      await extractClip(normalizedPath, clipPath, seg.start, seg.end)
+
+      // Слова для этого сегмента
+      const clipWords = words
+        .filter(w => w.start >= seg.start && w.end <= seg.end)
+        .map(w => ({ ...w, start: w.start - seg.start, end: w.end - seg.start }))
+
+      // Субтитры
+      let assPath = null
+      if (job.opt_subtitles && clipWords.length > 0) {
+        const dims = await getVideoDimensions(clipPath)
+        assPath = path.join(tmpDir, `clip_${i}.ass`)
+        generateASS(clipWords, assPath, dims.width, dims.height)
+      }
+
+      // Цветокоррекция + субтитры
+      const finalPath = path.join(tmpDir, `clip_${i}_final.mp4`)
+      if (job.opt_subtitles || job.opt_color) {
+        await applyFilters(clipPath, finalPath, { srtPath: assPath, color: job.opt_color })
+      } else {
+        fs.copyFileSync(clipPath, finalPath)
+      }
+
+      // Загружаем в Storage
+      const storagePath = `${userId}/clip_${jobId}_${i}.mp4`
+      const buf = fs.readFileSync(finalPath)
+      await supabase.storage.from('videos').upload(storagePath, buf, { contentType: 'video/mp4', upsert: true })
+
+      const { data: signed } = await supabase.storage.from('videos').createSignedUrl(storagePath, EXPIRES_IN)
+      resultClips.push({
+        index: i + 1,
+        title: seg.title || `Клип ${i + 1}`,
+        duration: Math.round(seg.end - seg.start),
+        url: signed?.signedUrl || null,
+        path: storagePath,
+      })
+
+      // Сообщаем о прогрессе
+      await supabase.from('video_jobs').update({
+        error_message: `Обрабатываю клип ${i + 1} из ${segments.length}...`
+      }).eq('id', jobId)
+    }
+
+    const expiresAt = new Date(Date.now() + EXPIRES_IN * 1000).toISOString()
+    await supabase.from('video_jobs').update({
+      status: 'done',
+      result_clips: resultClips,
+      finished_at: new Date().toISOString(),
+      expires_at: expiresAt,
+      error_message: null,
+    }).eq('id', jobId)
+
+    // Удаляем оригинал
+    await supabase.storage.from('videos').remove([job.storage_path])
+    console.log(`[${jobId}] CLIPS DONE: ${resultClips.length} clips`)
+
+  } catch (err) {
+    console.error(`[${jobId}] Clips error:`, err)
+    await supabase.from('video_jobs').update({
+      status: 'error',
+      error_message: err instanceof Error ? err.message : String(err),
+      finished_at: new Date().toISOString(),
+    }).eq('id', jobId)
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+}
+
+// Транскрипция с поддержкой длинных видео (чанки по 20 минут)
+async function transcribeWithChunking(videoPath, language, totalDuration) {
+  const CHUNK_SEC = 20 * 60 // 20 минут
+
+  if (totalDuration <= CHUNK_SEC) {
+    const result = await transcribeWithWhisper(videoPath, language)
+    return result.words || []
+  }
+
+  // Разбиваем на чанки
+  const allWords = []
+  const chunkCount = Math.ceil(totalDuration / CHUNK_SEC)
+
+  for (let i = 0; i < chunkCount; i++) {
+    const chunkStart = i * CHUNK_SEC
+    const chunkEnd = Math.min((i + 1) * CHUNK_SEC, totalDuration)
+    const chunkAudio = path.join(path.dirname(videoPath), `chunk_${i}.wav`)
+
+    // Вырезаем аудио-чанк
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .setStartTime(chunkStart)
+        .duration(chunkEnd - chunkStart)
+        .outputOptions(['-vn', '-ac', '1', '-ar', '16000', '-acodec', 'pcm_s16le', '-f', 'wav'])
+        .output(chunkAudio)
+        .on('end', resolve).on('error', reject).run()
+    })
+
+    try {
+      const result = await transcribeWithWhisper(chunkAudio, language)
+      const chunkWords = (result.words || []).map(w => ({
+        ...w,
+        start: w.start + chunkStart,
+        end: w.end + chunkStart,
+      }))
+      allWords.push(...chunkWords)
+      console.log(`Chunk ${i + 1}/${chunkCount}: ${chunkWords.length} words`)
+    } finally {
+      try { fs.unlinkSync(chunkAudio) } catch { /* ignore */ }
+    }
+  }
+
+  return allWords
+}
+
+// GPT находит N лучших сегментов для Reels
+async function findBestClipSegments(words, totalDuration, count) {
+  if (words.length < 5) {
+    // Fallback: нарезаем равномерно
+    const segDur = Math.min(60, totalDuration / count)
+    return Array.from({ length: count }, (_, i) => ({
+      start: i * (totalDuration / count),
+      end: i * (totalDuration / count) + segDur,
+      title: `Клип ${i + 1}`,
+    }))
+  }
+
+  const openai = getOpenAI()
+  // Берём каждое 3-е слово чтобы не превысить лимит токенов
+  const sample = words.filter((_, i) => i % 3 === 0)
+  const transcript = sample.map(w => `[${w.start.toFixed(0)}s] ${w.word}`).join(' ')
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{
+        role: 'user',
+        content: `Ты — эксперт по вирусному контенту для Instagram Reels и TikTok.
+
+Транскрипт видео (${Math.round(totalDuration / 60)} мин) с таймкодами:
+${transcript}
+
+Найди РОВНО ${count} лучших момента для отдельных Reels (каждый 30–90 секунд).
+Критерии: законченная мысль, интересная история, полезный совет, смешной момент.
+Сегменты НЕ должны пересекаться.
+
+Ответь ТОЛЬКО JSON без markdown:
+[{"start": <сек>, "end": <сек>, "title": "<название клипа>", "reason": "<почему>"}, ...]`,
+      }],
+      max_tokens: 500,
+      temperature: 0.3,
+    })
+
+    const text = response.choices[0]?.message?.content?.trim() || '[]'
+    const segments = JSON.parse(text)
+
+    return segments
+      .filter(s => typeof s.start === 'number' && typeof s.end === 'number' && s.end - s.start >= 15)
+      .slice(0, count)
+  } catch (e) {
+    console.warn('findBestClipSegments failed:', e.message)
+    // Fallback: равномерная нарезка
+    const segDur = Math.min(60, totalDuration / count)
+    return Array.from({ length: count }, (_, i) => ({
+      start: i * (totalDuration / count),
+      end: i * (totalDuration / count) + segDur,
+      title: `Клип ${i + 1}`,
+    }))
+  }
+}
+
+// Вырезаем один клип
+function extractClip(inputPath, outputPath, start, end) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .setStartTime(start)
+      .duration(end - start)
+      .outputOptions(['-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k'])
+      .output(outputPath)
+      .on('end', resolve).on('error', reject).run()
+  })
+}
+
 // ── Транскрипция через Whisper ──────────────────────────────────────────────
 // Whisper API: максимум 25 МБ — сначала извлекаем аудио (AAC/m4a, без MP3!)
 async function transcribeWithWhisper(videoPath, language) {

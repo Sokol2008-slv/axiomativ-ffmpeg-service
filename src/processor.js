@@ -166,7 +166,16 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
       console.log(`[${jobId}] Music mixed`)
     }
 
-    // 9. Загружаем результат в Supabase Storage
+    // 9. B-roll вставки (если есть PEXELS_API_KEY и opt_broll)
+    if (job.opt_broll && wordTimestamps.length > 0) {
+      const brollPath = path.join(tmpDir, 'with_broll.mp4')
+      console.log(`[${jobId}] Applying B-roll...`)
+      await applyBroll(currentPath, brollPath, wordTimestamps, tmpDir)
+      currentPath = brollPath
+      console.log(`[${jobId}] B-roll done`)
+    }
+
+    // 10. Загружаем результат в Supabase Storage
     const resultStoragePath = job.storage_path.replace(/^([^/]+\/[^/]+)/, '$1_processed')
     const fileBuffer = fs.readFileSync(currentPath)
 
@@ -936,6 +945,160 @@ function prependHook(inputPath, outputPath, hook) {
       .on('error', reject)
       .run()
   })
+}
+
+// ── B-roll вставки: ищем видео на Pexels и вставляем поверх пауз ────────────
+
+// Извлекаем ключевые темы из транскрипта для поиска B-roll
+async function extractBrollKeywords(words, count = 3) {
+  if (words.length < 5) return []
+  const openai = getOpenAI()
+  const text = words.map(w => w.word).join(' ').slice(0, 1000)
+  try {
+    const r = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{
+        role: 'user',
+        content: `Из этого текста извлеки ${count} ключевых визуальных тем для поиска B-roll видео на Pexels.
+Текст: "${text}"
+Ответь ТОЛЬКО JSON массивом коротких английских фраз (1-2 слова): ["keyword1", "keyword2", "keyword3"]`,
+      }],
+      max_tokens: 60,
+      temperature: 0.3,
+    })
+    const json = JSON.parse(r.choices[0]?.message?.content?.trim() || '[]')
+    return Array.isArray(json) ? json.slice(0, count) : []
+  } catch {
+    return []
+  }
+}
+
+// Ищем видео на Pexels по ключевому слову
+async function searchPexelsVideo(keyword) {
+  const apiKey = process.env.PEXELS_API_KEY
+  if (!apiKey) return null
+
+  const { default: fetch } = await import('node-fetch')
+  try {
+    const res = await fetch(
+      `https://api.pexels.com/videos/search?query=${encodeURIComponent(keyword)}&per_page=5&orientation=portrait`,
+      { headers: { Authorization: apiKey } }
+    )
+    if (!res.ok) return null
+    const data = await res.json()
+    const videos = data.videos || []
+    if (!videos.length) return null
+
+    // Берём видео 5-15 секунд
+    const suitable = videos.find(v => v.duration >= 5 && v.duration <= 15)
+    const video = suitable || videos[0]
+
+    // Выбираем файл HD или меньше
+    const file = video.video_files?.find(f => f.quality === 'hd') || video.video_files?.[0]
+    return file?.link || null
+  } catch {
+    return null
+  }
+}
+
+// Находим паузы в транскрипте (промежутки между словами > 1с) — вставляем туда B-roll
+function findBrollSlots(words, minPause = 1.0, maxSlots = 3) {
+  const slots = []
+  for (let i = 0; i < words.length - 1; i++) {
+    const gap = words[i + 1].start - words[i].end
+    if (gap >= minPause) {
+      slots.push({ start: words[i].end, end: words[i + 1].start, duration: gap })
+    }
+  }
+  // Сортируем по длительности паузы (берём самые длинные)
+  return slots.sort((a, b) => b.duration - a.duration).slice(0, maxSlots)
+}
+
+// Вставляем B-roll клип поверх основного видео в указанный промежуток
+// Используем overlay: B-roll поверх оригинала с fade in/out
+function overlayBroll(mainPath, brollPath, outputPath, slot, mainWidth, mainHeight) {
+  return new Promise((resolve, reject) => {
+    const duration = Math.min(slot.duration, 5) // не больше 5 сек
+    const fadeDur = 0.3
+
+    // B-roll: масштабируем, обрезаем до длительности паузы, добавляем fade
+    const filterComplex = [
+      `[1:v]scale=${mainWidth}:${mainHeight}:force_original_aspect_ratio=increase,crop=${mainWidth}:${mainHeight},` +
+      `trim=duration=${duration},setpts=PTS-STARTPTS,` +
+      `fade=t=in:st=0:d=${fadeDur},fade=t=out:st=${duration - fadeDur}:d=${fadeDur}[broll]`,
+      `[0:v][broll]overlay=0:0:enable='between(t,${slot.start},${slot.start + duration})'[outv]`,
+    ].join(';')
+
+    ffmpeg(mainPath)
+      .input(brollPath)
+      .outputOptions([
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-map', '0:a',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'copy',
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', (err) => {
+        // Если overlay упал — просто копируем исходник
+        fs.copyFileSync(mainPath, outputPath)
+        resolve()
+      })
+      .run()
+  })
+}
+
+// Полный пайплайн B-roll
+async function applyBroll(videoPath, outputPath, words, tmpDir) {
+  if (!process.env.PEXELS_API_KEY) {
+    console.log('PEXELS_API_KEY not set, skipping B-roll')
+    fs.copyFileSync(videoPath, outputPath)
+    return
+  }
+
+  const keywords = await extractBrollKeywords(words)
+  if (!keywords.length) {
+    fs.copyFileSync(videoPath, outputPath)
+    return
+  }
+  console.log('B-roll keywords:', keywords)
+
+  const slots = findBrollSlots(words)
+  if (!slots.length) {
+    fs.copyFileSync(videoPath, outputPath)
+    return
+  }
+
+  const dims = await getVideoDimensions(videoPath)
+  let currentPath = videoPath
+
+  for (let i = 0; i < Math.min(slots.length, keywords.length); i++) {
+    const keyword = keywords[i]
+    const slot = slots[i]
+    const brollUrl = await searchPexelsVideo(keyword)
+    if (!brollUrl) continue
+
+    const brollPath = path.join(tmpDir, `broll_${i}.mp4`)
+    try {
+      await downloadFile(brollUrl, brollPath)
+    } catch {
+      continue
+    }
+
+    const overlaidPath = path.join(tmpDir, `broll_out_${i}.mp4`)
+    await overlayBroll(currentPath, brollPath, overlaidPath, slot, dims.width, dims.height)
+    currentPath = overlaidPath
+    console.log(`B-roll ${i + 1}: "${keyword}" at ${slot.start.toFixed(1)}s`)
+  }
+
+  if (currentPath !== videoPath) {
+    fs.copyFileSync(currentPath, outputPath)
+  } else {
+    fs.copyFileSync(videoPath, outputPath)
+  }
 }
 
 // ── Авто-музыка: подбираем трек по настроению и миксуем ─────────────────────

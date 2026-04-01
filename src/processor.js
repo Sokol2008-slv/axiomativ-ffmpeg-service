@@ -132,7 +132,16 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
       console.log(`[${jobId}] Cutting ${cutSegments.length} segments (${whisperCuts.length} whisper + ${silenceCuts.length} silence)`)
       if (cutSegments.length > 0) {
         await cutFillers(currentPath, outputPath, cutSegments)
-        currentPath = outputPath
+        // Проверка: файл должен быть разумного размера (> 100 KB)
+        const outStats = fs.existsSync(outputPath) ? fs.statSync(outputPath) : null
+        const origStats = fs.statSync(currentPath)
+        if (outStats && outStats.size > 100 * 1024 && outStats.size > origStats.size * 0.05) {
+          currentPath = outputPath
+          console.log(`[${jobId}] Fillers cut: ${origStats.size} → ${outStats.size} bytes`)
+        } else {
+          console.warn(`[${jobId}] cutFillers output suspiciously small (${outStats?.size ?? 0} bytes vs orig ${origStats.size}), skipping filler cut`)
+          cutSegments = [] // Сбрасываем — субтитры будут без сдвига таймкодов
+        }
       }
     }
 
@@ -688,36 +697,34 @@ function invertSegments(cutSegs, totalDuration) {
 }
 
 // ── Применяем субтитры и цветокоррекцию ─────────────────────────────────────
+// Многоуровневый fallback: если полная цепочка падает — пробуем упрощённую
 async function applyFilters(inputPath, outputPath, options) {
   const { srtPath, color } = options
 
-  const vFilters = []
-
-  // Цветокоррекция — Instagram/Reels grade
-  // Принцип: лифт теней + тёплые тона + мягкий контраст, НЕ линейный saturation
-  if (color) {
-    // 1. Per-channel curves: лифт теней, тёплые мидтоны, убираем синий холод
-    //    R: тени → 0.04 (лифт), мидтоны → 0.52 (чуть теплее)
-    //    G: тени → 0.04 (лифт), мидтоны нейтраль
-    //    B: тени → 0.02 (меньше лифт), мидтоны → 0.48 (убираем холод камеры)
-    vFilters.push("curves=r='0/0.04 0.5/0.52 1/1':g='0/0.04 0.5/0.50 1/1':b='0/0.02 0.5/0.48 1/1'")
-    // 2. Тепло в тенях и мидтонах через colorbalance (маленькие значения!)
-    vFilters.push('colorbalance=rs=0.05:gs=0:bs=-0.04:rm=0.03:gm=0:bm=-0.03')
-    // 3. Насыщенность 1.06 (не 1.10!) — не перекручивать красные и кожу
-    vFilters.push('eq=saturation=1.06:contrast=1.04')
-    // 4. Мягкая резкость — 0.12 вместо 0.2, без артефактов на сжатом видео
-    vFilters.push('unsharp=3:3:0.12')
+  // Строим ASS-фильтр (экранируем путь под FFmpeg)
+  const buildAssFilter = () => {
+    if (!srtPath) return []
+    const escaped = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:')
+    return [`ass='${escaped}'`]
   }
 
-  // Субтитры — используем ASS фильтр (точный контроль размера под разрешение)
-  if (srtPath) {
-    const escapedAss = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:')
-    vFilters.push(`ass='${escapedAss}'`)
-  }
+  // Полная цветокоррекция: curves (| как разделитель точек!) + colorbalance + eq + unsharp
+  const buildColorAdvanced = () => [
+    // | вместо пробела — надёжнее в любом контексте без shell
+    "curves=r='0/0.04|0.5/0.52|1/1':g='0/0.04|0.5/0.50|1/1':b='0/0.02|0.5/0.48|1/1'",
+    'colorbalance=rs=0.05:gs=0:bs=-0.04:rm=0.03:gm=0:bm=-0.03',
+    'eq=saturation=1.06:contrast=1.04',
+    'unsharp=3:3:0.12',
+  ]
 
-  const filterStr = vFilters.join(',')
+  // Упрощённая цветокоррекция: только eq + unsharp (работает на любом FFmpeg)
+  const buildColorSimple = () => [
+    'eq=saturation=1.08:contrast=1.03:brightness=0.01',
+    'unsharp=3:3:0.15',
+  ]
 
-  return new Promise((resolve, reject) => {
+  // Базовая функция запуска FFmpeg с заданным filterStr (null = без видеофильтров)
+  const runFilter = (filterStr) => new Promise((resolve, reject) => {
     const cmd = ffmpeg(inputPath)
       .outputOptions([
         '-c:v', 'libx264',
@@ -731,17 +738,51 @@ async function applyFilters(inputPath, outputPath, options) {
         '-movflags', '+faststart',
         '-threads', '2',
       ])
-
-    if (filterStr) {
-      cmd.videoFilter(filterStr)
-    }
-
-    cmd
-      .output(outputPath)
-      .on('end', resolve)
-      .on('error', reject)
-      .run()
+    if (filterStr) cmd.videoFilter(filterStr)
+    cmd.output(outputPath).on('end', resolve).on('error', reject).run()
   })
+
+  const cleanOutput = () => {
+    try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath) } catch { /* ignore */ }
+  }
+
+  // Попытка 1: полная цветокоррекция + субтитры
+  const fullStr = [...(color ? buildColorAdvanced() : []), ...buildAssFilter()].join(',')
+  try {
+    await runFilter(fullStr || null)
+    return
+  } catch (err) {
+    console.warn(`[applyFilters] Attempt 1 (full) failed: ${err.message}`)
+    cleanOutput()
+  }
+
+  // Попытка 2: упрощённая цветокоррекция + субтитры
+  const simpleStr = [...(color ? buildColorSimple() : []), ...buildAssFilter()].join(',')
+  if (simpleStr !== fullStr) {
+    try {
+      await runFilter(simpleStr || null)
+      return
+    } catch (err) {
+      console.warn(`[applyFilters] Attempt 2 (simple color) failed: ${err.message}`)
+      cleanOutput()
+    }
+  }
+
+  // Попытка 3: только субтитры (без цветокоррекции)
+  if (srtPath) {
+    const assStr = buildAssFilter().join(',')
+    try {
+      await runFilter(assStr)
+      return
+    } catch (err) {
+      console.warn(`[applyFilters] Attempt 3 (ass only) failed: ${err.message}`)
+      cleanOutput()
+    }
+  }
+
+  // Последний fallback: просто перекодируем без фильтров (гарантированно работает)
+  console.warn('[applyFilters] All filter attempts failed, falling back to plain transcode')
+  await runFilter(null)
 }
 
 // ── Детект тишины через FFmpeg (для "э" которые Whisper пропустил) ──────────

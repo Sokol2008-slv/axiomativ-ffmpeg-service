@@ -168,16 +168,8 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
 
     console.log(`[${jobId}] Done! Expires at: ${expiresAt}`)
 
-    // 11. Планируем удаление обработанного файла через 24 часа
-    // (неблокирующий setTimeout — Railway держит процесс живым)
-    setTimeout(async () => {
-      try {
-        await supabase.storage.from('videos').remove([resultStoragePath])
-        console.log(`[${jobId}] Auto-deleted processed file after 24h`)
-      } catch (e) {
-        console.warn(`[${jobId}] Failed to auto-delete processed file:`, e)
-      }
-    }, EXPIRES_IN * 1000)
+    // 11. Удаление файла происходит при следующем старте сервиса (cleanupExpiredFiles)
+    // setTimeout не используем — Railway перезапускает контейнер и таймер теряется
 
   } catch (err) {
     console.error(`[${jobId}] Error:`, err)

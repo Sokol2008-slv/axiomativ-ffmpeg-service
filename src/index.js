@@ -181,6 +181,23 @@ app.listen(PORT, async () => {
         .in('id', stuckJobs.map(j => j.id))
       console.log(`Recovered ${stuckJobs.length} stuck jobs on startup`)
     }
+
+    // Удаляем файлы из Storage у джобов с истёкшим expires_at
+    const { data: expiredJobs } = await supabase
+      .from('video_jobs')
+      .select('id, result_path')
+      .eq('status', 'done')
+      .lt('expires_at', new Date().toISOString())
+      .not('result_path', 'is', null)
+
+    if (expiredJobs?.length) {
+      const paths = expiredJobs.map(j => j.result_path).filter(Boolean)
+      await supabase.storage.from('videos').remove(paths)
+      await supabase.from('video_jobs')
+        .update({ result_path: null, result_url: null })
+        .in('id', expiredJobs.map(j => j.id))
+      console.log(`Cleaned up ${expiredJobs.length} expired files on startup`)
+    }
   } catch (e) {
     console.warn('Startup recovery failed:', e.message)
   }

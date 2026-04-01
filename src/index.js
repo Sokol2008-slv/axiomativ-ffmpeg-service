@@ -82,6 +82,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     optSubtitles = true,
     optSubtitlesLang = 'auto',
     optColor = true,
+    optHook = false,
   } = options
 
   const userId = user.id  // берём из верифицированного JWT
@@ -99,6 +100,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       opt_subtitles: optSubtitles,
       opt_subtitles_lang: optSubtitlesLang,
       opt_color: optColor,
+      opt_hook: optHook,
     })
     .select()
     .single()

@@ -92,7 +92,25 @@ export async function processVideoJob(jobId, userId, uploadedFilePath = null) {
       console.log(`[${jobId}] Whisper got ${wordTimestamps.length} words`)
     }
 
-    // 5. Удаляем паузы и слова-паразиты
+    // 5. Авто-хук: найти самый цепляющий момент и поставить его в начало
+    if (job.opt_hook && wordTimestamps.length > 0) {
+      const hookResult = await findHookSegment(wordTimestamps)
+      if (hookResult) {
+        const hookedPath = path.join(tmpDir, 'hooked.mp4')
+        await prependHook(currentPath, hookedPath, hookResult)
+        currentPath = hookedPath
+        // Пересчитываем таймстемпы: хук добавлен в начало
+        const hookDuration = hookResult.end - hookResult.start
+        wordTimestamps = [
+          ...wordTimestamps.filter(w => w.start >= hookResult.start && w.end <= hookResult.end)
+            .map(w => ({ ...w, start: w.start - hookResult.start, end: w.end - hookResult.start })),
+          ...wordTimestamps.map(w => ({ ...w, start: w.start + hookDuration, end: w.end + hookDuration })),
+        ]
+        console.log(`[${jobId}] Hook prepended: ${hookResult.start.toFixed(2)}s–${hookResult.end.toFixed(2)}s`)
+      }
+    }
+
+    // 6. Удаляем паузы и слова-паразиты
     let cutSegments = []
     if (job.opt_fillers) {
       const outputPath = path.join(tmpDir, `no_fillers.mp4`)
@@ -576,6 +594,84 @@ function getVideoDuration(videoPath) {
       if (err) reject(err)
       else resolve(meta.format.duration || 0)
     })
+  })
+}
+
+// ── Авто-хук: находим самый цепляющий момент через OpenAI ───────────────────
+// Возвращает { start, end } сегмента который нужно поставить в начало
+async function findHookSegment(words) {
+  if (words.length < 10) return null
+
+  const openai = getOpenAI()
+
+  // Собираем транскрипт с таймкодами для GPT
+  const transcript = words.map(w => `[${w.start.toFixed(1)}] ${w.word}`).join(' ')
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{
+        role: 'user',
+        content: `Ты — эксперт по созданию вирусного контента для Instagram Reels и TikTok.
+
+Вот транскрипт видео с таймкодами (формат [секунда] слово):
+${transcript}
+
+Найди ОДИН момент (15–45 секунд) который:
+- Начинается с интригующей фразы, вопроса или сильного утверждения
+- Заставит зрителя хотеть досмотреть видео до конца
+- Лучше всего подходит как "хук" для начала Reels/TikTok
+
+Ответь ТОЛЬКО JSON без markdown:
+{"start": <секунда начала>, "end": <секунда конца>, "reason": "<1 предложение почему>"}`,
+      }],
+      max_tokens: 100,
+      temperature: 0.3,
+    })
+
+    const text = response.choices[0]?.message?.content?.trim() || ''
+    const json = JSON.parse(text)
+
+    if (typeof json.start === 'number' && typeof json.end === 'number') {
+      const duration = json.end - json.start
+      if (duration >= 5 && duration <= 60) {
+        console.log(`Hook found: ${json.start}s–${json.end}s — ${json.reason}`)
+        return { start: json.start, end: json.end }
+      }
+    }
+  } catch (e) {
+    console.warn('findHookSegment failed:', e.message)
+  }
+  return null
+}
+
+// Вставляем хук в начало видео через FFmpeg concat
+function prependHook(inputPath, outputPath, hook) {
+  return new Promise((resolve, reject) => {
+    // Вырезаем хук-сегмент + добавляем оригинал после него
+    const filterComplex = [
+      `[0:v]trim=start=${hook.start}:end=${hook.end},setpts=PTS-STARTPTS[hv]`,
+      `[0:a]atrim=start=${hook.start}:end=${hook.end},asetpts=PTS-STARTPTS[ha]`,
+      `[0:v]setpts=PTS-STARTPTS[ov]`,
+      `[0:a]asetpts=PTS-STARTPTS[oa]`,
+      `[hv][ha][ov][oa]concat=n=2:v=1:a=1[outv][outa]`,
+    ].join(';')
+
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-map', '[outa]',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+      ])
+      .output(outputPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run()
   })
 }
 
